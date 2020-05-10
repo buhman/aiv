@@ -302,7 +302,11 @@ main(int argc, char *argv[])
 
   mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
   values[0] = screen->white_pixel;
-  values[1] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_BUTTON_PRESS;
+  values[1] = XCB_EVENT_MASK_EXPOSURE
+    | XCB_EVENT_MASK_KEY_PRESS
+    | XCB_EVENT_MASK_BUTTON_PRESS
+    | XCB_EVENT_MASK_BUTTON_RELEASE
+    | XCB_EVENT_MASK_POINTER_MOTION;
   xcb_create_window(connection,
                     XCB_COPY_FROM_PARENT,
                     window,
@@ -322,46 +326,83 @@ main(int argc, char *argv[])
   aiv_image_t aiv_image;
   xcb_pixmap_t pixmap;
   xcb_gcontext_t gc;
+  int image_index;
+  xcb_get_geometry_reply_t *geometry;
 
-  ret = open_image("../test.png", AV_PIX_FMT_RGB32, &aiv_image);
-  enprintf(ret, "open_image: %s", "../test.png");
+  image_index = 1;
 
-  pixmap = xcb_generate_id(connection);
-  xcb_create_pixmap(connection, screen->root_depth, pixmap, screen->root,
-                    aiv_image.codec_context->width,
-                    aiv_image.codec_context->height);
+  void
+  load_image()
+  {
+    ret = open_image(argv[image_index], AV_PIX_FMT_RGB32, &aiv_image);
+    enprintf(ret, "open_image[%d]: %s", image_index, argv[image_index]);
 
-  gc = xcb_generate_id(connection);
-  xcb_create_gc(connection, gc, pixmap, 0, NULL);
+    pixmap = xcb_generate_id(connection);
+    xcb_create_pixmap(connection, screen->root_depth, pixmap, screen->root,
+                      aiv_image.codec_context->width,
+                      aiv_image.codec_context->height);
 
-
-  //
-
-  ret = next_frame(&aiv_image);
-  enprintf(ret, "next_frame");
-
-  xcb_void_cookie_t cookie;
-
-  cookie = xcb_put_image(connection,
-                         XCB_IMAGE_FORMAT_Z_PIXMAP,
-                         pixmap,
-                         gc,
-                         //
-                         aiv_image.codec_context->width,
-                         aiv_image.codec_context->height,
-                         0,
-                         0,
-                         //
-                         0,
-                         screen->root_depth,
-                         aiv_image.buf_size,
-                         aiv_image.buf);
-  printf("cookie %i %i %i\n", cookie.sequence, pixmap, gc);
-
+    gc = xcb_generate_id(connection);
+    xcb_create_gc(connection, gc, pixmap, 0, NULL);
+  }
 
   //
 
-  xcb_flush(connection);
+  int x;
+  int y;
+  int origin_x = 0;
+  int origin_y = 0;
+  int drag_state = 0;
+
+  x = 0;
+  y = 0;
+
+  void
+  load_frame()
+  {
+    ret = next_frame(&aiv_image);
+    enprintf(ret, "next_frame");
+
+    xcb_put_image(connection,
+                  XCB_IMAGE_FORMAT_Z_PIXMAP,
+                  pixmap,
+                  gc,
+                  //
+                  aiv_image.codec_context->width,
+                  aiv_image.codec_context->height,
+                  0,
+                  0,
+                  //
+                  0,
+                  screen->root_depth,
+                  aiv_image.buf_size,
+                  aiv_image.buf);
+  }
+
+  void
+  render(uint8_t clear)
+  {
+    fprintf(stderr, "render: geometry: %d %d\n", geometry->width, geometry->height);
+
+    xcb_clear_area(connection,
+                   clear,
+                   window,
+                   0,
+                   0,
+                   geometry->width,
+                   geometry->height);
+
+    xcb_copy_area(connection, pixmap, window, gc,
+                  0, 0,
+                  x, y,
+                  aiv_image.codec_context->width,
+                  aiv_image.codec_context->height);
+  }
+
+  //
+
+  load_image();
+  load_frame();
 
   //
 
@@ -381,19 +422,65 @@ main(int argc, char *argv[])
         xcb_expose_event_t *expose = (xcb_expose_event_t *)event;
         fprintf(stderr, "%d %d %d %d\n", expose->x, expose->y, expose->width, expose->height);
 
-        xcb_copy_area(connection, pixmap, window, gc,
-                      0, 0,
-                      50, 50,
-                      aiv_image.codec_context->width,
-                      aiv_image.codec_context->height);
+        geometry = xcb_get_geometry_reply(connection,
+                                          xcb_get_geometry(connection, window),
+                                          NULL);
 
-        xcb_flush(connection);
+        render(0);
       }
       break;
     case XCB_BUTTON_PRESS:
       {
-        //xcb_button_press_event_t *press = (xcb_button_press_event_t *)event;
-        fprintf(stderr, "button press");
+        xcb_button_press_event_t *button = (xcb_button_press_event_t *)event;
+        fprintf(stderr, "p");
+
+        origin_x = button->event_x;
+        origin_y = button->event_y;
+        drag_state = 1;
+      }
+      break;
+    case XCB_BUTTON_RELEASE:
+      {
+        xcb_button_release_event_t *button = (xcb_button_release_event_t *)event;
+        fprintf(stderr, "r");
+        //xcb_button_release_event_t *button = (xcb_button_release_event_t *)event;
+        origin_x = button->event_x;
+        origin_y = button->event_y;
+        drag_state = 0;
+      }
+      break;
+    case XCB_MOTION_NOTIFY:
+      {
+        //fprintf(stderr, "%d %d\n", x, y);
+        xcb_motion_notify_event_t *motion = (xcb_motion_notify_event_t *)event;
+        if (drag_state == 1
+            && x != motion->event_x - origin_x
+            && y != motion->event_y - origin_y) {
+          x = motion->event_x - origin_x;
+          y = motion->event_y - origin_y;
+          render(1);
+        }
+      }
+      break;
+    case XCB_KEY_PRESS:
+      {
+        xcb_key_press_event_t *key = (xcb_key_press_event_t *)event;
+        switch (key->detail) {
+        case 65: // space
+          image_index++;
+          if (image_index == argc)
+            image_index = 1;
+          load_image();
+          load_frame();
+          render(1);
+          fprintf(stderr, "next image");
+
+          break;
+        default:
+          fprintf(stderr, "key %d\n", key->detail);
+          break;
+        }
+
       }
       break;
     default:
@@ -401,6 +488,7 @@ main(int argc, char *argv[])
       break;
     }
     free(event);
+    xcb_flush(connection);
   }
 
   xcb_disconnect(connection);
